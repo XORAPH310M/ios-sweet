@@ -1,0 +1,141 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -550,12 +550,116 @@
+ 
+ static struct ist40xx_touch_state a80_touch_state;
+ 
++/* GPIO open drain: release the line for a logic one, drive only low. */
++#define A80_SDA 6u
++#define A80_SCL 7u
++
++static bool
++a80_gpio_level(unsigned pin)
++{
++    return (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & 1u) != 0;
++}
++
++static void
++a80_gpio_line(unsigned pin, bool release)
++{
++    touch_gpio(pin, 0, 3, 0, !release, false);
++    delay(5);
++}
++
++static int
++a80_gpio_clock_high(void)
++{
++    a80_gpio_line(A80_SCL, true);
++    for (unsigned wait = 0; wait < 100; ++wait) {
++        if (a80_gpio_level(A80_SCL)) {
++            return 0;
++        }
++        delay(10);
++    }
++    return ETIMEDOUT;
++}
++
++static int
++a80_gpio_start(void)
++{
++    a80_gpio_line(A80_SDA, true);
++    int error = a80_gpio_clock_high();
++    if (error || !a80_gpio_level(A80_SDA)) {
++        return error ? error : EBUSY;
++    }
++    a80_gpio_line(A80_SDA, false);
++    a80_gpio_line(A80_SCL, false);
++    return 0;
++}
++
++static int
++a80_gpio_bit(bool release, bool *sample)
++{
++    a80_gpio_line(A80_SDA, release);
++    int error = a80_gpio_clock_high();
++    if (!error && sample) {
++        *sample = a80_gpio_level(A80_SDA);
++    }
++    a80_gpio_line(A80_SCL, false);
++    return error;
++}
++
++static int
++a80_gpio_write(uint8_t byte)
++{
++    for (unsigned bit = 0; bit < 8; ++bit) {
++        int error = a80_gpio_bit((byte & 0x80u) != 0, NULL);
++        if (error) {
++            return error;
++        }
++        byte <<= 1;
++    }
++    bool nack = true;
++    int error = a80_gpio_bit(true, &nack);
++    return error ? error : (nack ? ENXIO : 0);
++}
++
++static int
++a80_gpio_read(uint8_t *byte, bool last)
++{
++    *byte = 0;
++    for (unsigned bit = 0; bit < 8; ++bit) {
++        bool level = false;
++        int error = a80_gpio_bit(true, &level);
++        if (error) {
++            return error;
++        }
++        *byte = (uint8_t)((*byte << 1) | level);
++    }
++    return a80_gpio_bit(last, NULL);
++}
++
+ static int
+ a80_ist40xx_transfer(uint8_t slave, const uint8_t *address, unsigned address_size,
+     uint8_t *response, unsigned response_size)
+ {
+-    int error = touch_msg(slave, address, address_size, NULL, 0, true);
+-    return error ? error : touch_msg(slave, NULL, 0, response, response_size, false);
++    int error = a80_gpio_start();
++    if (error) {
++        return error;
++    }
++    error = a80_gpio_write((uint8_t)(slave << 1));
++    for (unsigned i = 0; !error && i < address_size; ++i) {
++        error = a80_gpio_write(address[i]);
++    }
++    if (!error) {
++        error = a80_gpio_start();
++    }
++    if (!error) {
++        error = a80_gpio_write((uint8_t)((slave << 1) | 1u));
++    }
++    for (unsigned i = 0; !error && i < response_size; ++i) {
++        error = a80_gpio_read(&response[i], i + 1 == response_size);
++    }
++    a80_gpio_line(A80_SDA, false);
++    int stop_error = a80_gpio_clock_high();
++    a80_gpio_line(A80_SDA, true);
++    return error ? error : stop_error;
+ }
+ 
+ static void
+@@ -628,14 +732,14 @@
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+-	if (!touch_clocks() || !touch_se_init()) {
+-		goto out;
+-	}
+ 	int a80_ist40xx = 0;
+ 	(void)PE_parse_boot_argn("a80ist40xx", &a80_ist40xx, sizeof(a80_ist40xx));
+ 	if (a80_ist40xx) {
+-		/* The first probe uses inherited pinmux and the digital enable. */
++		printf("A80 IST40XX: GPIO I2C, SDA=%u SCL=%u\n", A80_SDA, A80_SCL);
+ 		a80_ist40xx_run();
++		goto out;
++	}
++	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
