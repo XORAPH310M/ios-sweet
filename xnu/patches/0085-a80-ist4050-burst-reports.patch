@@ -1,0 +1,67 @@
+diff --git a/bsd/dev/ist40xx-geni.h b/bsd/dev/ist40xx-geni.h
+--- a/bsd/dev/ist40xx-geni.h
++++ b/bsd/dev/ist40xx-geni.h
+@@ -45,14 +45,31 @@
+     if (count > IST40XX_CONTACTS) {
+         return -1;
+     }
+-    uint8_t records[IST40XX_CONTACTS * IST40XX_RECORD_BYTES] = {0};
+-    for (unsigned index = 0; index < count; ++index) {
+-        error = ist40xx_read_word(transfer,
+-                                  UINT32_C(0xb00b0108) + index * IST40XX_RECORD_BYTES,
+-                                  records + index * IST40XX_RECORD_BYTES);
+-        if (error != 0) {
+-            return error;
++    if (count == 0) {
++        return 0;
++    }
++    uint8_t records[IST40XX_CONTACTS * 16] = {0};
++    unsigned first = count > 5 ? 5 : count;
++    const uint8_t primary[] = {0xb8, 0x0b, 0x01, 0x08};
++    error = transfer(0x50, primary, sizeof(primary), records, first * 16);
++    for (unsigned i = 1; !error && i < first; ++i) {
++        for (unsigned j = 0; j < 4; ++j) {
++            records[i * 8 + j] = records[i * 16 + j];
+         }
++    }
++    if (!error && count > first) {
++        uint8_t extended[5 * 16];
++        const uint8_t secondary[] = {0x88, 0x00, 0x42, 0x70};
++        error = transfer(0x50, secondary, sizeof(secondary), extended,
++            (count - first) * 16);
++        for (unsigned i = first; !error && i < count; ++i) {
++            for (unsigned j = 0; j < 4; ++j) {
++                records[i * 8 + j] = extended[(i - first) * 16 + j];
++            }
++        }
++    }
++    if (error) {
++        return error;
+     }
+     return ist40xx_dispatch_report(state, records, count, emit) ? 0 : -1;
+ }
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -736,15 +736,19 @@
+         return;
+     }
+     unsigned failures = 0;
+-    while (!st.dead && failures < 10) {
++    while (!st.dead) {
+         bool irq_high = (touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) != 0;
+         if (irq_high != (irq_active_low != 0)) {
+             error = ist40xx_read_report(a80_ist40xx_transfer,
+                 &a80_touch_state, sweet_hid_touch);
+             if (error) {
+-                if (failures++ == 0) {
++                if (failures == 0 || failures == 9) {
+                     printf("A80 IST40XX: report error=%d\n", error);
+                 }
++                if (++failures == 10) {
++                    a80_ist40xx_release();
++                }
++                touch_wait(30);
+             } else {
+                 failures = 0;
+             }
