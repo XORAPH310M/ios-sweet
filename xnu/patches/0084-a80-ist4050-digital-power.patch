@@ -1,0 +1,160 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -551,8 +551,8 @@
+ static struct ist40xx_touch_state a80_touch_state;
+ 
+ /* GPIO open drain: release the line for a logic one, drive only low. */
+-#define A80_SDA 6u
+-#define A80_SCL 7u
++static unsigned a80_sda = 6;
++static unsigned a80_scl = 7;
+ 
+ static bool
+ a80_gpio_level(unsigned pin)
+@@ -570,9 +570,9 @@
+ static int
+ a80_gpio_clock_high(void)
+ {
+-    a80_gpio_line(A80_SCL, true);
++    a80_gpio_line(a80_scl, true);
+     for (unsigned wait = 0; wait < 100; ++wait) {
+-        if (a80_gpio_level(A80_SCL)) {
++        if (a80_gpio_level(a80_scl)) {
+             return 0;
+         }
+         delay(10);
+@@ -583,25 +583,25 @@
+ static int
+ a80_gpio_start(void)
+ {
+-    a80_gpio_line(A80_SDA, true);
++    a80_gpio_line(a80_sda, true);
+     int error = a80_gpio_clock_high();
+-    if (error || !a80_gpio_level(A80_SDA)) {
++    if (error || !a80_gpio_level(a80_sda)) {
+         return error ? error : EBUSY;
+     }
+-    a80_gpio_line(A80_SDA, false);
+-    a80_gpio_line(A80_SCL, false);
++    a80_gpio_line(a80_sda, false);
++    a80_gpio_line(a80_scl, false);
+     return 0;
+ }
+ 
+ static int
+ a80_gpio_bit(bool release, bool *sample)
+ {
+-    a80_gpio_line(A80_SDA, release);
++    a80_gpio_line(a80_sda, release);
+     int error = a80_gpio_clock_high();
+     if (!error && sample) {
+-        *sample = a80_gpio_level(A80_SDA);
+-    }
+-    a80_gpio_line(A80_SCL, false);
++        *sample = a80_gpio_level(a80_sda);
++    }
++    a80_gpio_line(a80_scl, false);
+     return error;
+ }
+ 
+@@ -647,18 +647,18 @@
+     for (unsigned i = 0; !error && i < address_size; ++i) {
+         error = a80_gpio_write(address[i]);
+     }
+-    if (!error) {
++    if (!error && response_size) {
+         error = a80_gpio_start();
+     }
+-    if (!error) {
++    if (!error && response_size) {
+         error = a80_gpio_write((uint8_t)((slave << 1) | 1u));
+     }
+     for (unsigned i = 0; !error && i < response_size; ++i) {
+         error = a80_gpio_read(&response[i], i + 1 == response_size);
+     }
+-    a80_gpio_line(A80_SDA, false);
++    a80_gpio_line(a80_sda, false);
+     int stop_error = a80_gpio_clock_high();
+-    a80_gpio_line(A80_SDA, true);
++    a80_gpio_line(a80_sda, true);
+     return error ? error : stop_error;
+ }
+ 
+@@ -674,10 +674,53 @@
+     }
+ }
+ 
++/* The R1Q DT connects the panel digital enable to PCAL6524 P0_1. */
++static int
++a80_panel_digital_enable(void)
++{
++    int error = sweet_rpmh_vreg_enable("ldoa10", 1720);
++    if (error) {
++        return error;
++    }
++    touch_wait(20);
++    a80_sda = 46;
++    a80_scl = 47;
++    const uint8_t out_reg = 0x04;
++    const uint8_t cfg_reg = 0x0c;
++    uint8_t out = 0, cfg = 0;
++    error = a80_ist40xx_transfer(0x22, &out_reg, 1, &out, 1);
++    if (!error) {
++        error = a80_ist40xx_transfer(0x22, &cfg_reg, 1, &cfg, 1);
++    }
++    if (!error) {
++        const uint8_t set_output[] = {out_reg, (uint8_t)(out | 2u)};
++        error = a80_ist40xx_transfer(0x22, set_output, 2, NULL, 0);
++    }
++    if (!error) {
++        const uint8_t set_direction[] = {cfg_reg, (uint8_t)(cfg & ~2u)};
++        error = a80_ist40xx_transfer(0x22, set_direction, 2, NULL, 0);
++    }
++    if (!error) {
++        error = a80_ist40xx_transfer(0x22, &out_reg, 1, &out, 1);
++    }
++    if (!error) {
++        error = a80_ist40xx_transfer(0x22, &cfg_reg, 1, &cfg, 1);
++    }
++    a80_sda = 6;
++    a80_scl = 7;
++    printf("A80 IST40XX: PCAL6524 out=%#x cfg=%#x error=%d\n", out, cfg, error);
++    return error ? error : ((out & 2u) && !(cfg & 2u) ? 0 : EIO);
++}
++
+ static void
+ a80_ist40xx_run(void)
+ {
+-    int power_error = sweet_rpmh_vreg_enable("ldoa18", 3000);
++    int power_error = a80_panel_digital_enable();
++    if (power_error) {
++        printf("A80 IST40XX: digital enable error=%d\n", power_error);
++        return;
++    }
++    power_error = sweet_rpmh_vreg_enable("ldoa18", 3000);
+     if (power_error) {
+         printf("A80 IST40XX: L18 enable error=%d\n", power_error);
+         return;
+@@ -735,7 +778,7 @@
+ 	int a80_ist40xx = 0;
+ 	(void)PE_parse_boot_argn("a80ist40xx", &a80_ist40xx, sizeof(a80_ist40xx));
+ 	if (a80_ist40xx) {
+-		printf("A80 IST40XX: GPIO I2C, SDA=%u SCL=%u\n", A80_SDA, A80_SCL);
++		printf("A80 IST40XX: GPIO I2C, SDA=%u SCL=%u\n", a80_sda, a80_scl);
+ 		a80_ist40xx_run();
+ 		goto out;
+ 	}
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -329,7 +329,8 @@
+ {
+ 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+ 	bool sweet_rail = res && !strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400;
+-	bool a80_rail = res && !strcmp(res, "ldoa18") && mv == 3000;
++	bool a80_rail = res && ((!strcmp(res, "ldoa18") && mv == 3000) ||
++	    (!strcmp(res, "ldoa10") && mv == 1720));
+ 	if (!sweet_rail && !a80_rail) {
+ 		printf("SWEET RPMH: unsupported touch regulator or voltage\n");
+ 		return EINVAL;
