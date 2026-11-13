@@ -1,0 +1,273 @@
+diff --git a/bsd/dev/ist40xx-geni.h b/bsd/dev/ist40xx-geni.h
+new file mode 100644
+index 0000000..1a9eba9
+--- /dev/null
++++ b/bsd/dev/ist40xx-geni.h
+@@ -0,0 +1,60 @@
++#ifndef A80_IST40XX_GENI_H
++#define A80_IST40XX_GENI_H
++
++#include "ist40xx-report.h"
++
++/* The transport must send the four address bytes, a repeated START,
++ * then read the response from the same I2C slave.
++ */
++typedef int (*ist40xx_transfer)(uint8_t slave, const uint8_t *address,
++                               unsigned address_size, uint8_t *response,
++                               unsigned response_size);
++
++static inline int
++ist40xx_read_word(ist40xx_transfer transfer, uint32_t reg, uint8_t word[4])
++{
++    const uint8_t address[] = {reg >> 24, reg >> 16, reg >> 8, reg};
++    return transfer(0x50, address, sizeof(address), word, 4);
++}
++
++static inline int
++ist40xx_read_chip_id(ist40xx_transfer transfer, uint32_t *chip_id)
++{
++    uint8_t word[4];
++    int error = ist40xx_read_word(transfer, UINT32_C(0xc0001000), word);
++    if (error == 0) {
++        *chip_id = ((uint32_t)word[0] << 24) | ((uint32_t)word[1] << 16)
++                 | ((uint32_t)word[2] << 8) | word[3];
++    }
++    return error;
++}
++
++/* Run when the board IRQ is asserted, after successful chip identification.
++ * Collect the entire report before mutating contact state.
++ */
++static inline int
++ist40xx_read_report(ist40xx_transfer transfer, struct ist40xx_touch_state *state,
++                    void (*emit)(int, int, int, int))
++{
++    uint8_t status[4];
++    int error = ist40xx_read_word(transfer, UINT32_C(0xb00b0104), status);
++    if (error != 0) {
++        return error;
++    }
++    unsigned count = status[2] >> 4;
++    if (count > IST40XX_CONTACTS) {
++        return -1;
++    }
++    uint8_t records[IST40XX_CONTACTS * IST40XX_RECORD_BYTES] = {0};
++    for (unsigned index = 0; index < count; ++index) {
++        error = ist40xx_read_word(transfer,
++                                  UINT32_C(0xb00b0108) + index * IST40XX_RECORD_BYTES,
++                                  records + index * IST40XX_RECORD_BYTES);
++        if (error != 0) {
++            return error;
++        }
++    }
++    return ist40xx_dispatch_report(state, records, count, emit) ? 0 : -1;
++}
++
++#endif
+diff --git a/bsd/dev/ist40xx-report.h b/bsd/dev/ist40xx-report.h
+new file mode 100644
+index 0000000..23bc134
+--- /dev/null
++++ b/bsd/dev/ist40xx-report.h
+@@ -0,0 +1,81 @@
++#ifndef A80_IST40XX_REPORT_H
++#define A80_IST40XX_REPORT_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++enum {
++    IST40XX_CONTACTS = 10,
++    IST40XX_RECORD_BYTES = 8,
++    IST40XX_X_LIMIT = 1080,
++    IST40XX_Y_LIMIT = 2400,
++};
++
++struct ist40xx_contact {
++    unsigned slot;
++    bool down;
++    unsigned x;
++    unsigned y;
++};
++
++/* Decode one four-byte coordinate word from an eight-byte record.
++ * Release events require the caller's last known position for the slot.
++ */
++static inline bool
++ist40xx_decode_contact(const uint8_t wire[4], struct ist40xx_contact *contact)
++{
++    unsigned id = wire[0] >> 4;
++    unsigned event = wire[0] & 0xf;
++    unsigned x = ((unsigned)wire[1] << 4) | (wire[2] >> 4);
++    unsigned y = ((unsigned)(wire[2] & 0xf) << 8) | wire[3];
++
++    if (id == 0 || id > IST40XX_CONTACTS || (event != 1 && event != 2)) {
++        return false;
++    }
++    if (event == 1 && (x >= IST40XX_X_LIMIT || y >= IST40XX_Y_LIMIT)) {
++        return false;
++    }
++    *contact = (struct ist40xx_contact) {
++        .slot = id - 1,
++        .down = event == 1,
++        .x = event == 1 ? x : 0,
++        .y = event == 1 ? y : 0,
++    };
++    return true;
++}
++
++struct ist40xx_touch_state {
++    struct ist40xx_contact slots[IST40XX_CONTACTS];
++};
++
++/* Call only for a complete interrupt report. Missing slots stay active
++ * until the controller sends their release event.
++ */
++static inline bool
++ist40xx_dispatch_report(struct ist40xx_touch_state *state,
++                        const uint8_t *records, unsigned count,
++                        void (*emit)(int, int, int, int))
++{
++    if (count > IST40XX_CONTACTS) {
++        return false;
++    }
++    for (unsigned index = 0; index < count; ++index) {
++        struct ist40xx_contact contact;
++        if (!ist40xx_decode_contact(records + index * IST40XX_RECORD_BYTES,
++                                    &contact)) {
++            continue;
++        }
++        struct ist40xx_contact *slot = &state->slots[contact.slot];
++        if (contact.down) {
++            *slot = contact;
++        } else if (slot->down) {
++            slot->down = false;
++        } else {
++            continue;
++        }
++        emit(slot->slot, slot->down, slot->x, slot->y);
++    }
++    return true;
++}
++
++#endif
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..4b706fc 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -328,8 +328,10 @@ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+ 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	bool sweet_rail = res && !strcmp(res, "ldoc11") && mv >= 2950 && mv <= 3400;
++	bool a80_rail = res && !strcmp(res, "ldoa18") && mv == 3000;
++	if (!sweet_rail && !a80_rail) {
++		printf("SWEET RPMH: unsupported touch regulator or voltage\n");
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..0f8679b 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -19,6 +19,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++#include "ist40xx-geni.h"
++
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+@@ -214,7 +216,7 @@ static int
+ touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+     unsigned nr, bool stretch)
+ {
+-	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
++	if (st.dead || nt > 4 || nr > 90 || (nt && nr) || (!nt && !nr)) {
+ 		return EIO;
+ 	}
+ 	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+@@ -545,6 +547,66 @@ touch_se_init(void)
+ 	return true;
+ }
+ 
++
++static struct ist40xx_touch_state a80_touch_state;
++
++static int
++a80_ist40xx_transfer(uint8_t slave, const uint8_t *address, unsigned address_size,
++    uint8_t *response, unsigned response_size)
++{
++    int error = touch_msg(slave, address, address_size, NULL, 0, true);
++    return error ? error : touch_msg(slave, NULL, 0, response, response_size, false);
++}
++
++static void
++a80_ist40xx_release(void)
++{
++    for (unsigned i = 0; i < IST40XX_CONTACTS; ++i) {
++        struct ist40xx_contact *slot = &a80_touch_state.slots[i];
++        if (slot->down) {
++            sweet_hid_touch(slot->slot, 0, slot->x, slot->y);
++            slot->down = false;
++        }
++    }
++}
++
++static void
++a80_ist40xx_run(void)
++{
++    int power_error = sweet_rpmh_vreg_enable("ldoa18", 3000);
++    if (power_error) {
++        printf("A80 IST40XX: L18 enable error=%d\n", power_error);
++        return;
++    }
++    touch_wait(100);
++    uint32_t id = 0;
++    int irq_active_low = 1;
++    (void)PE_parse_boot_argn("a80istirqlo", &irq_active_low, sizeof(irq_active_low));
++    int error = ist40xx_read_chip_id(a80_ist40xx_transfer, &id);
++    printf("A80 IST40XX: chip=%#x error=%d gpio9=%u irq-low=%d\n",
++        id, error, touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u, !!irq_active_low);
++    if (error || id != 0x4050u) {
++        return;
++    }
++    unsigned failures = 0;
++    while (!st.dead && failures < 10) {
++        bool irq_high = (touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) != 0;
++        if (irq_high != (irq_active_low != 0)) {
++            error = ist40xx_read_report(a80_ist40xx_transfer,
++                &a80_touch_state, sweet_hid_touch);
++            if (error) {
++                if (failures++ == 0) {
++                    printf("A80 IST40XX: report error=%d\n", error);
++                }
++            } else {
++                failures = 0;
++            }
++        }
++        touch_wait(10);
++    }
++    a80_ist40xx_release();
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -569,6 +631,13 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
++	int a80_ist40xx = 0;
++	(void)PE_parse_boot_argn("a80ist40xx", &a80_ist40xx, sizeof(a80_ist40xx));
++	if (a80_ist40xx) {
++		/* The first probe uses inherited pinmux and the digital enable. */
++		a80_ist40xx_run();
++		goto out;
++	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
